@@ -30,10 +30,12 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #else
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include "getopt/getopt.h"
 #endif
 
@@ -54,6 +56,10 @@ typedef int socklen_t;
 #define SOCKET_ERROR -1
 #endif
 
+#define DEFAULT_PORT_STR "1234"
+#define DEFAULT_SAMPLE_RATE_HZ 2048000
+#define DEFAULT_MAX_NUM_BUFFERS 500
+
 static SOCKET s;
 
 static pthread_t tcp_worker_thread;
@@ -61,7 +67,14 @@ static pthread_t command_thread;
 static pthread_cond_t exit_cond;
 static pthread_mutex_t exit_cond_lock;
 
+static pthread_mutex_t ll_mutex;
 static pthread_cond_t cond;
+
+struct llist {
+	char *data;
+	size_t len;
+	struct llist *next;
+};
 
 typedef struct { /* structure size must be multiple of 2 bytes */
 	char magic[4];
@@ -72,34 +85,27 @@ typedef struct { /* structure size must be multiple of 2 bytes */
 static rtlsdr_dev_t *dev = NULL;
 
 static int enable_biastee = 0;
-
-// Ring Buffer declarations
-// 8MB appears to cover several seconds at high bitrates -- about as much lag as you'd want
-#define RINGBUFSZ_INIT (8*1024*1024)
-static int ringbuf_sz = RINGBUFSZ_INIT;
-static int ringbuf_trimsz = 512*1024;
-static unsigned char *ringbuf = NULL;
-static volatile unsigned int ringbuf_head = 0;
-static volatile unsigned int ringbuf_tail = 0;
-static unsigned int total_radio_bytes = 0;
-static unsigned int max_bytes_in_flight = 0;
+static int global_numq = 0;
+static struct llist *ll_buffers = 0;
+static int llbuf_num = DEFAULT_MAX_NUM_BUFFERS;
 
 static volatile int do_exit = 0;
 
+
 void usage(void)
 {
-	printf("rtl_tcp, an I/Q spectrum server for RTL2832 based DVB-T receivers\n\n"
-		"Usage:\t[-a listen address]\n"
-		"\t[-p listen port (default: 1234)]\n"
-		"\t[-f frequency to tune to [Hz]]\n"
-		"\t[-g gain (default: 0 for auto)]\n"
-		"\t[-s samplerate in Hz (default: 2048000 Hz)]\n"
-		"\t[-b number of buffers (default: 15, set by library)]\n"
-		"\t[-n max number of linked list buffers to keep (default: 500)]\n"
-		"\t[-d device index (default: 0)]\n"
-		"\t[-P ppm_error (default: 0)]\n"
-		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
-		"\t[-D enable direct sampling (default: off)]\n");
+	printf("rtl_tcp, an I/Q spectrum server for RTL2832 based DVB-T receivers\n\n");
+	printf("Usage:\t[-a listen address]\n");
+	printf("\t[-p listen port (default: %s)]\n", DEFAULT_PORT_STR);
+	printf("\t[-f frequency to tune to [Hz]]\n");
+	printf("\t[-g gain (default: 0 for auto)]\n");
+	printf("\t[-s samplerate in Hz (default: %d Hz)]\n", DEFAULT_SAMPLE_RATE_HZ);
+	printf("\t[-b number of buffers (default: 15, set by library)]\n");
+	printf("\t[-n max number of linked list buffers to keep (default: %d)]\n", DEFAULT_MAX_NUM_BUFFERS);
+	printf("\t[-d device index (default: 0)]\n");
+	printf("\t[-P ppm_error (default: 0)]\n");
+	printf("\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3/v4 dongles)]\n");
+	printf("\t[-D enable direct sampling (default: off)]\n");
 	exit(1);
 }
 
@@ -139,6 +145,7 @@ sighandler(int signum)
 #else
 static void sighandler(int signum)
 {
+	signal(SIGPIPE, SIG_IGN);
 	fprintf(stderr, "Signal caught, exiting!\n");
 	rtlsdr_cancel_async(dev);
 	do_exit = 1;
@@ -147,60 +154,53 @@ static void sighandler(int signum)
 
 void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
-    static time_t lasttime = 0;
-	static int lastbytes = 0;
-	time_t curtime;
-
 	if(!do_exit) {
-		unsigned int bufferleft;
+		struct llist *rpt = (struct llist*)malloc(sizeof(struct llist));
+		rpt->data = (char*)malloc(len);
+		memcpy(rpt->data, buf, len);
+		rpt->len = len;
+		rpt->next = NULL;
 
-		if (ringbuf == NULL)
-		{
-			printf("Allocate %d bytes for ringbuf.\n", ringbuf_sz);
-			ringbuf = (unsigned char*)malloc(ringbuf_sz);
-		}
+		pthread_mutex_lock(&ll_mutex);
 
-		bufferleft = ringbuf_sz - ((ringbuf_head < ringbuf_tail) ? (ringbuf_head - ringbuf_tail + ringbuf_sz) : (ringbuf_head - ringbuf_tail));
-		if (len < bufferleft)
-		{
-			if ((ringbuf_head+len) < (unsigned int)ringbuf_sz)
-			{
-				memcpy(((unsigned char*)(ringbuf+ringbuf_head)), buf, len);
+		if (ll_buffers == NULL) {
+			ll_buffers = rpt;
+		} else {
+			struct llist *cur = ll_buffers;
+			int num_queued = 0;
+
+			while (cur->next != NULL) {
+				cur = cur->next;
+				num_queued++;
 			}
-			else
-			{
-				memcpy(((unsigned char*)ringbuf+ringbuf_head), buf, ringbuf_sz-ringbuf_head);
-				memcpy((unsigned char*)ringbuf, buf+(ringbuf_sz-ringbuf_head), len-(ringbuf_sz-ringbuf_head));
-			}
-			ringbuf_head = (ringbuf_head + len) % ringbuf_sz;
-		}
-		else
-		{
-			printf("overrun: head=%d tail=%d, Trimming %d bytes from tail of buffer\n", ringbuf_head, ringbuf_tail, ringbuf_trimsz);
-			ringbuf_tail = (ringbuf_tail + ringbuf_trimsz) % ringbuf_sz;
-		}
 
-		total_radio_bytes += len;
-		curtime = time (NULL);
-		if ((curtime - lasttime) > 30)
-		{
-		   int nsecs = curtime - lasttime;
-		   int nbytes = total_radio_bytes - lastbytes;
-		   int bytes_in_flight = (ringbuf_head - ringbuf_tail);
-		   if (bytes_in_flight < 0)
-			  bytes_in_flight = ringbuf_sz + bytes_in_flight;
-		   lasttime=curtime;
-		   lastbytes=total_radio_bytes;
-		   printf(">> [ %3.2fMB/s ]  [ bytes_in_flight(cur/max) = %4dK / %4dK ]\n",
-			  (float)nbytes/(float)nsecs/1000.0/1000.0, bytes_in_flight/1024, max_bytes_in_flight/1024);
-		   max_bytes_in_flight=0;
+			if(llbuf_num && llbuf_num == num_queued-2){
+				struct llist *curelem;
+
+				free(ll_buffers->data);
+				curelem = ll_buffers->next;
+				free(ll_buffers);
+				ll_buffers = curelem;
+			}
+
+			cur->next = rpt;
+
+			if (num_queued > global_numq)
+				printf("ll+, now %d\n", num_queued);
+			else if (num_queued < global_numq)
+				printf("ll-, now %d\n", num_queued);
+
+			global_numq = num_queued;
 		}
+		pthread_cond_signal(&cond);
+		pthread_mutex_unlock(&ll_mutex);
 	}
 }
 
 static void *tcp_worker(void *arg)
 {
-	int bytesleft, bytessent;
+	struct llist *curelem,*prev;
+	int bytesleft,bytessent, index;
 	struct timeval tv= {1,0};
 	struct timespec ts;
 	struct timeval tp;
@@ -211,33 +211,47 @@ static void *tcp_worker(void *arg)
 		if(do_exit)
 			pthread_exit(0);
 
-		bytesleft = (ringbuf_head < ringbuf_tail) ?
-		            (ringbuf_head - ringbuf_tail + ringbuf_sz) :
-					(ringbuf_head - ringbuf_tail);
-		while (bytesleft > 0)
-		{
-		   FD_ZERO(&writefds);
-		   FD_SET(s, &writefds);
-		   tv.tv_sec = 1;
-		   tv.tv_usec = 0;
-		   r = select(s+1, NULL, &writefds, NULL, &tv);
-		   if(r) {
-			  unsigned int sendchunk;
-			  if (ringbuf_tail < ringbuf_head)
-				 sendchunk = ringbuf_head - ringbuf_tail;
-			  else
-				 sendchunk = ringbuf_sz - ringbuf_tail;
-			  if (sendchunk > max_bytes_in_flight)
-				 max_bytes_in_flight = sendchunk;
-			  bytessent = send(s,  (unsigned char*)(ringbuf+ringbuf_tail), sendchunk, 0);
-			  bytesleft -= bytessent;
-			  ringbuf_tail = (ringbuf_tail + bytessent) % ringbuf_sz;
-		   }
-		   if(bytessent == SOCKET_ERROR || do_exit) {
-			  printf("worker socket bye\n");
-			  sighandler(0);
-			  pthread_exit(NULL);
-		   }
+		pthread_mutex_lock(&ll_mutex);
+		gettimeofday(&tp, NULL);
+		ts.tv_sec  = tp.tv_sec+5;
+		ts.tv_nsec = tp.tv_usec * 1000;
+		r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
+		if(r == ETIMEDOUT) {
+			pthread_mutex_unlock(&ll_mutex);
+			printf("worker cond timeout\n");
+			sighandler(0);
+			pthread_exit(NULL);
+		}
+
+		curelem = ll_buffers;
+		ll_buffers = 0;
+		pthread_mutex_unlock(&ll_mutex);
+
+		while(curelem != 0) {
+			bytesleft = curelem->len;
+			index = 0;
+			bytessent = 0;
+			while(bytesleft > 0) {
+				FD_ZERO(&writefds);
+				FD_SET(s, &writefds);
+				tv.tv_sec = 1;
+				tv.tv_usec = 0;
+				r = select(s+1, NULL, &writefds, NULL, &tv);
+				if(r) {
+					bytessent = send(s,  &curelem->data[index], bytesleft, 0);
+					bytesleft -= bytessent;
+					index += bytessent;
+				}
+				if(bytessent == SOCKET_ERROR || do_exit) {
+						printf("worker socket bye\n");
+						sighandler(0);
+						pthread_exit(NULL);
+				}
+			}
+			prev = curelem;
+			curelem = curelem->next;
+			free(prev->data);
+			free(prev);
 		}
 	}
 }
@@ -366,10 +380,18 @@ static void *command_worker(void *arg)
 int main(int argc, char **argv)
 {
 	int r, opt, i;
-	char* addr = "127.0.0.1";
-	int port = 1234;
-	uint32_t frequency = 100000000, samp_rate = 2048000;
-	struct sockaddr_in local, remote;
+	char *addr = "127.0.0.1";
+	const char *port = DEFAULT_PORT_STR;
+	uint32_t frequency = 100000000, samp_rate = DEFAULT_SAMPLE_RATE_HZ;
+	struct sockaddr_storage local, remote;
+	struct addrinfo *ai;
+	struct addrinfo *aiHead;
+	struct addrinfo  hints = { 0 };
+	char hostinfo[NI_MAXHOST];
+	char portinfo[NI_MAXSERV];
+	char remhostinfo[NI_MAXHOST];
+	char remportinfo[NI_MAXSERV];
+	int aiErr;
 	uint32_t buf_num = 0;
 	int dev_index = 0;
 	int dev_given = 0;
@@ -381,7 +403,7 @@ int main(int argc, char **argv)
 	void *status;
 	struct timeval tv = {1,0};
 	struct linger ling = {1,0};
-	SOCKET listensocket;
+	SOCKET listensocket = 0;
 	socklen_t rlen;
 	fd_set readfds;
 	u_long blockmode = 1;
@@ -393,7 +415,7 @@ int main(int argc, char **argv)
 	struct sigaction sigact, sigign;
 #endif
 
-	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:d:P:T:D")) != -1) {
+	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:n:d:P:TD")) != -1) {
 		switch (opt) {
 		case 'd':
 			dev_index = verbose_device_search(optarg);
@@ -409,13 +431,16 @@ int main(int argc, char **argv)
 			samp_rate = (uint32_t)atofs(optarg);
 			break;
 		case 'a':
-			addr = optarg;
+		        addr = strdup(optarg);
 			break;
 		case 'p':
-			port = atoi(optarg);
+		        port = strdup(optarg);
 			break;
 		case 'b':
 			buf_num = atoi(optarg);
+			break;
+		case 'n':
+			llbuf_num = atoi(optarg);
 			break;
 		case 'P':
 			ppm_error = atoi(optarg);
@@ -440,7 +465,7 @@ int main(int argc, char **argv)
 	}
 
 	if (dev_index < 0) {
-		exit(1);
+	    exit(1);
 	}
 
 	rtlsdr_open(&dev, (uint32_t)dev_index);
@@ -463,9 +488,8 @@ int main(int argc, char **argv)
 #endif
 
 	/* Set direct sampling */
-        if (direct_sampling) {
+        if (direct_sampling)
                 verbose_direct_sampling(dev, 2);
-        }
 
 	/* Set the tuner error */
 	verbose_ppm_set(dev, ppm_error);
@@ -511,20 +535,47 @@ int main(int argc, char **argv)
 		fprintf(stderr, "WARNING: Failed to reset buffers.\n");
 
 	pthread_mutex_init(&exit_cond_lock, NULL);
+	pthread_mutex_init(&ll_mutex, NULL);
 	pthread_mutex_init(&exit_cond_lock, NULL);
 	pthread_cond_init(&cond, NULL);
 	pthread_cond_init(&exit_cond, NULL);
 
-	memset(&local,0,sizeof(local));
-	local.sin_family = AF_INET;
-	local.sin_port = htons(port);
-	local.sin_addr.s_addr = inet_addr(addr);
+	hints.ai_flags  = AI_PASSIVE; /* Server mode. */
+	hints.ai_family = PF_UNSPEC;  /* IPv4 or IPv6. */
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
 
-	listensocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	r = 1;
-	setsockopt(listensocket, SOL_SOCKET, SO_REUSEADDR, (char *)&r, sizeof(int));
-	setsockopt(listensocket, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
-	bind(listensocket,(struct sockaddr *)&local,sizeof(local));
+	if ((aiErr = getaddrinfo(addr,
+				 port,
+				 &hints,
+				 &aiHead )) != 0)
+	{
+		fprintf(stderr, "local address %s ERROR - %s.\n",
+		        addr, gai_strerror(aiErr));
+		return(-1);
+	}
+	memcpy(&local, aiHead->ai_addr, aiHead->ai_addrlen);
+
+	for (ai = aiHead; ai != NULL; ai = ai->ai_next) {
+		aiErr = getnameinfo((struct sockaddr *)ai->ai_addr, ai->ai_addrlen,
+				    hostinfo, NI_MAXHOST,
+				    portinfo, NI_MAXSERV, NI_NUMERICSERV | NI_NUMERICHOST);
+		if (aiErr)
+			fprintf( stderr, "getnameinfo ERROR - %s.\n",hostinfo);
+
+		listensocket = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (listensocket < 0)
+			continue;
+
+		r = 1;
+		setsockopt(listensocket, SOL_SOCKET, SO_REUSEADDR, (char *)&r, sizeof(int));
+		setsockopt(listensocket, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+
+		if (bind(listensocket, (struct sockaddr *)&local, aiHead->ai_addrlen))
+			fprintf(stderr, "rtl_tcp bind error: %s", strerror(errno));
+		else
+			break;
+	}
 
 #ifdef _WIN32
 	ioctlsocket(listensocket, FIONBIO, &blockmode);
@@ -535,11 +586,11 @@ int main(int argc, char **argv)
 
 	while(1) {
 		printf("listening...\n");
-		printf("Use the device argument 'rtl_tcp=%s:%d' in OsmoSDR "
-			   "(gr-osmosdr) source\n"
-			   "to receive samples in GRC and control "
-			   "rtl_tcp parameters (frequency, gain, ...).\n",
-			   addr, port);
+		printf("Use the device argument 'rtl_tcp=%s:%s' in OsmoSDR "
+		       "(gr-osmosdr) source\n"
+		       "to receive samples in GRC and control "
+		       "rtl_tcp parameters (frequency, gain, ...).\n",
+		       hostinfo, portinfo);
 		listen(listensocket,1);
 
 		while(1) {
@@ -559,7 +610,10 @@ int main(int argc, char **argv)
 
 		setsockopt(s, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
 
-		printf("client accepted!\n");
+		getnameinfo((struct sockaddr *)&remote, rlen,
+			    remhostinfo, NI_MAXHOST,
+			    remportinfo, NI_MAXSERV, NI_NUMERICSERV);
+		printf("client accepted! %s %s\n", remhostinfo, remportinfo);
 
 		memset(&dongle_info, 0, sizeof(dongle_info));
 		memcpy(&dongle_info.magic, "RTL0", 4);
@@ -590,20 +644,24 @@ int main(int argc, char **argv)
 		closesocket(s);
 
 		printf("all threads dead..\n");
-		
-		// Clear stale data for next client
-		ringbuf_head = ringbuf_tail = 0;
-		memset(ringbuf, 0, ringbuf_sz);
+		curelem = ll_buffers;
+		ll_buffers = 0;
+
+		while(curelem != 0) {
+			prev = curelem;
+			curelem = curelem->next;
+			free(prev->data);
+			free(prev);
+		}
 
 		do_exit = 0;
+		global_numq = 0;
 	}
 
 out:
 	rtlsdr_close(dev);
 	closesocket(listensocket);
 	closesocket(s);
-	if (ringbuf)
-	   free(ringbuf);
 #ifdef _WIN32
 	WSACleanup();
 #endif

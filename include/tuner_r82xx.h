@@ -80,6 +80,7 @@ struct r82xx_priv {
 	enum r82xx_xtal_cap_value	xtal_cap_sel;
 	uint16_t			pll;	/* kHz */
 	uint32_t			int_freq;
+	uint32_t			rf_freq;
 	uint8_t				fil_cal_code;
 	uint8_t				input;
 	int				has_lock;
@@ -116,5 +117,7 @@ int r82xx_init(struct r82xx_priv *priv);
 int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq);
 int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain);
 int r82xx_set_bandwidth(struct r82xx_priv *priv, int bandwidth,  uint32_t rate);
+int r82xx_toggle_test(struct r82xx_priv *priv, int toggle);
+int r82xx_set_vga_gain(struct r82xx_priv *priv);
 
 #endif

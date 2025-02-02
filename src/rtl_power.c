@@ -133,7 +133,7 @@ void usage(void)
 		"\t[-d device_index (default: 0)]\n"
 		"\t[-g tuner_gain (default: automatic)]\n"
 		"\t[-p ppm_error (default: 0)]\n"
-		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
+		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3/v4 dongles)]\n"
 		"\tfilename (a '-' dumps samples to stdout)\n"
 		"\t (omitting the filename also uses stdout)\n"
 		"\n"
@@ -195,6 +195,7 @@ sighandler(int signum)
 #else
 static void sighandler(int signum)
 {
+	signal(SIGPIPE, SIG_IGN);
 	do_exit++;
 	multi_bail();
 }
@@ -437,8 +438,16 @@ void frequency_range(char *arg, double crop)
 	/* hacky string parsing */
 	start = arg;
 	stop = strchr(start, ':') + 1;
+	if (stop == (char *)1) {
+		fprintf(stderr, "Bad frequency range specification: %s\n", arg);
+		exit(1);
+	}
 	stop[-1] = '\0';
 	step = strchr(stop, ':') + 1;
+	if (step == (char *)1) {
+		fprintf(stderr, "Bad frequency range specification: %s\n", arg);
+		exit(1);
+	}
 	step[-1] = '\0';
 	lower = (int)atofs(start);
 	upper = (int)atofs(stop);
@@ -913,7 +922,7 @@ int main(int argc, char **argv)
 #endif
 
 	if (direct_sampling) {
-		verbose_direct_sampling(dev, 2);
+		verbose_direct_sampling(dev, 1);
 	}
 
 	if (offset_tuning) {

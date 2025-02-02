@@ -33,13 +33,17 @@
 #define MHZ(x)		((x)*1000*1000)
 #define KHZ(x)		((x)*1000)
 
+#define HF 1
+#define VHF 2
+#define UHF 3
+
 /*
  * Static constants
  */
 
 /* Those initial values start from REG_SHADOW_START */
 static const uint8_t r82xx_init_array[NUM_REGS] = {
-	0x83, 0x32, 0x75,			/* 05 to 07 */
+	0x83, 0x30, 0x75,			/* 05 to 07 */
 	0xc0, 0x40, 0xd6, 0x6c,			/* 08 to 0b */
 	0xf5, 0x63, 0x75, 0x68,			/* 0c to 0f */
 	0x6c, 0x83, 0x80, 0x00,			/* 10 to 13 */
@@ -330,8 +334,14 @@ static int r82xx_read(struct r82xx_priv *priv, uint8_t reg, uint8_t *val, int le
 	priv->buf[0] = reg;
 
 	rc = rtlsdr_i2c_write_fn(priv->rtl_dev, priv->cfg->i2c_addr, priv->buf, 1);
-	if (rc < 1)
-		return rc;
+
+	if (rc != 1) {
+		fprintf(stderr, "%s: i2c wr failed=%d reg=%02x len=%d\n",
+			   __FUNCTION__, rc, reg, 1);
+		if (rc < 0)
+			return rc;
+		return -1;
+	}
 
 	rc = rtlsdr_i2c_read_fn(priv->rtl_dev, priv->cfg->i2c_addr, p, len);
 
@@ -447,15 +457,13 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	if (rc < 0)
 		return rc;
 
-	/* set VCO current = 100 RTL-SDRBLOG MOD: MAX CURRENT*/
+	/* set VCO current = 100 */
+	/* rc = r82xx_write_reg_mask(priv, 0x12, 0x80, 0xe0); */
+
+	/* RTL-SDR Blog Modification: Set VCO current to MAX */
 	rc = r82xx_write_reg_mask(priv, 0x12, 0x06, 0xff);
 	if (rc < 0)
 		return rc;
-
-	// Test turning tracking filter off
-	//rc = r82xx_write_reg_mask(priv, 0x1a, 0x40, 0xC0);
-
-
 
 	/* Calculate divider */
 	while (mix_div <= 64) {
@@ -545,6 +553,8 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 
 		if (!i) {
 			/* Didn't lock. Increase VCO current */
+			/* rc = r82xx_write_reg_mask(priv, 0x12, 0x60, 0xe0); */
+			/* RTL-SDR Blog Hack: Set max current */
 			rc = r82xx_write_reg_mask(priv, 0x12, 0x06, 0xff);
 			if (rc < 0)
 				return rc;
@@ -668,9 +678,10 @@ static int r82xx_sysfreq_sel(struct r82xx_priv *priv, uint32_t freq,
 	rc = r82xx_write_reg_mask(priv, 0x11, cp_cur, 0x38);
 	if (rc < 0)
 		return rc;
-	
-	// RTLSDRBLOG. Improve L-band performance by setting PLL drop out to 2.0v
+
+	/* RTL-SDR Blog Hack. Improve L-band performance by setting PLL drop out to 2.0v */
         div_buf_cur = 0xa0;
+
 	rc = r82xx_write_reg_mask(priv, 0x17, div_buf_cur, 0x30);
 	if (rc < 0)
 		return rc;
@@ -781,12 +792,12 @@ static int r82xx_set_tv_standard(struct r82xx_priv *priv,
 	/* BW < 6 MHz */
 	if_khz = 3570;
 	filt_cal_lo = 56000;	/* 52000->56000 */
-	filt_gain = 0x10;	/* +3db, 6mhz on */
+	filt_gain = 0x30;	/* +3db, 6mhz on */
 	img_r = 0x00;		/* image negative */
 	filt_q = 0x10;		/* r10[4]:low q(1'b1) */
 	hp_cor = 0x6b;		/* 1.7m disable, +2cap, 1.0mhz */
 	ext_enable = 0x60;	/* r30[6]=1 ext enable; r30[5]:1 ext at lna max-1 */
-	loop_through = 0x01;	/* r5[7], lt off */
+	loop_through = 0x80;	/* r5[7], lt off */
 	lt_att = 0x00;		/* r31[7], lt att enable */
 	flt_ext_widest = 0x00;	/* r15[7]: flt_ext_wide off */
 	polyfil_cur = 0x60;	/* r25[6:5]:min */
@@ -975,8 +986,7 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 		if (rc < 0)
 			return rc;
 
-		/* set fixed VGA gain for now (16.3 dB) */
-		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); //init val 0x08 0x0c works well at 1.7
+		rc = r82xx_set_vga_gain(priv);
 		if (rc < 0)
 			return rc;
 
@@ -1014,11 +1024,34 @@ int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain)
 
 		/* set fixed VGA gain for now (26.5 dB) */
 		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0b, 0x9f);
+
 		if (rc < 0)
 			return rc;
 	}
 
 	return 0;
+}
+
+int r82xx_set_vga_gain(struct r82xx_priv *priv) {
+
+	int rc;
+
+	/* set fixed VGA gain based on frequency */
+	/* Disable for now. While it improves performance in some applications
+	   it appears to severely degrade performance in others */
+	/*if (priv->rf_freq > MHZ(1350)) {
+		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0f, 0x9f); // Max 40.5 dB
+	}
+	else if (priv->rf_freq > MHZ(1000)) {
+		rc = r82xx_write_reg_mask(priv, 0x0c, 0x0b, 0x9f);
+	}
+	else {
+		rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
+	}*/
+
+	rc = r82xx_write_reg_mask(priv, 0x0c, 0x08, 0x9f); // 16.3 dB
+
+	return rc;
 }
 
 /* Bandwidth contribution by low-pass filter. */
@@ -1094,16 +1127,55 @@ int r82xx_set_bandwidth(struct r82xx_priv *priv, int bw, uint32_t rate)
 
 	return priv->int_freq;
 }
+
+int r82xx_toggle_test(struct r82xx_priv *priv, int toggle)
+{
+	int rc;
+
+	if (toggle)
+	{
+		fprintf(stderr, "TOGGLE ON \n");
+		rc = r82xx_write_reg_mask(priv, 0x17, 0x08, 0x08); /* open_d notch on */
+	}
+	else
+	{
+		fprintf(stderr, "TOGGLE OFF \n");
+		rc = r82xx_write_reg_mask(priv, 0x17, 0x00, 0x08); /* open_d notch off */
+	}
+
+	return rc;
+}
+
 #undef FILT_HP_BW1
 #undef FILT_HP_BW2
 
 int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 {
 	int rc = -1;
-	uint32_t lo_freq = freq + priv->int_freq;
+	int is_rtlsdr_blog_v4;
+	uint32_t upconvert_freq;
+	uint32_t lo_freq;
 	uint8_t air_cable1_in;
+	uint8_t open_d;
+	uint8_t band;
+	uint8_t cable_2_in;
+	uint8_t cable_1_in;
+	uint8_t air_in;
+
+	is_rtlsdr_blog_v4 = rtlsdr_check_dongle_model(priv->rtl_dev, "RTLSDRBlog", "Blog V4");
+
+	/* if it's an RTL-SDR Blog V4, automatically upconvert by 28.8 MHz if we tune to HF
+	 * so that we don't need to manually set any upconvert offset in the SDR software */
+	upconvert_freq = is_rtlsdr_blog_v4 ? ((freq < MHZ(28.8)) ? (freq + MHZ(28.8)) : freq) : freq;
+      	priv->rf_freq = upconvert_freq;
+
+	lo_freq = upconvert_freq + priv->int_freq;
 
 	rc = r82xx_set_mux(priv, lo_freq);
+	if (rc < 0)
+		goto err;
+
+	rc = r82xx_set_vga_gain(priv);
 	if (rc < 0)
 		goto err;
 
@@ -1111,16 +1183,66 @@ int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq)
 	if (rc < 0 || !priv->has_lock)
 		goto err;
 
-	/* switch between 'Cable1' and 'Air-In' inputs on sticks with
-	 * R828D tuner. We switch at 345 MHz, because that's where the
-	 * noise-floor has about the same level with identical LNA
-	 * settings. The original driver used 320 MHz. */
-	air_cable1_in = (freq > MHZ(345)) ? 0x00 : 0x60;
+	if (is_rtlsdr_blog_v4) {
+		/* determine if notch filters should be on or off notches are turned OFF
+		 * when tuned within the notch band and ON when tuned outside the notch band.
+		 */
+		open_d = (freq <= MHZ(2.2) || (freq >= MHZ(85) && freq <= MHZ(112)) || (freq >= MHZ(172) && freq <= MHZ(242))) ? 0x00 : 0x08;
+		rc = r82xx_write_reg_mask(priv, 0x17, open_d, 0x08);
 
-	if ((priv->cfg->rafael_chip == CHIP_R828D) &&
-	    (air_cable1_in != priv->input)) {
-		priv->input = air_cable1_in;
-		rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+		if (rc < 0)
+			return rc;
+
+		/* select tuner band based on frequency and only switch if there is a band change
+		 *(to avoid excessive register writes when tuning rapidly)
+		 */
+		band = (freq <= MHZ(28.8)) ? HF : ((freq > MHZ(28.8) && freq < MHZ(250)) ? VHF : UHF);
+
+		/* switch between tuner inputs on the RTL-SDR Blog V4 */
+		if (band != priv->input) {
+			priv->input = band;
+
+			/* activate cable 2 (HF input) */
+			cable_2_in = (band == HF) ? 0x08 : 0x00;
+			rc = r82xx_write_reg_mask(priv, 0x06, cable_2_in, 0x08);
+
+			if (rc < 0)
+				goto err;
+
+			/* Control upconverter GPIO switch on newer batches */
+			rc = rtlsdr_set_bias_tee_gpio(priv->rtl_dev, 5, !cable_2_in);
+
+			if (rc < 0)
+				goto err;
+
+			/* activate cable 1 (VHF input) */
+			cable_1_in = (band == VHF) ? 0x40 : 0x00;
+			rc = r82xx_write_reg_mask(priv, 0x05, cable_1_in, 0x40);
+
+			if (rc < 0)
+				goto err;
+
+			/* activate air_in (UHF input) */
+			air_in = (band == UHF) ? 0x00 : 0x20;
+			rc = r82xx_write_reg_mask(priv, 0x05, air_in, 0x20);
+
+			if (rc < 0)
+				goto err;
+		}
+	}
+	else /* Standard R828D dongle*/
+	{
+		/* switch between 'Cable1' and 'Air-In' inputs on sticks with
+		* R828D tuner. We switch at 345 MHz, because that's where the
+		* noise-floor has about the same level with identical LNA
+		* settings. The original driver used 320 MHz. */
+		air_cable1_in = (freq > MHZ(345)) ? 0x00 : 0x60;
+
+		if ((priv->cfg->rafael_chip == CHIP_R828D) &&
+			(air_cable1_in != priv->input)) {
+			priv->input = air_cable1_in;
+			rc = r82xx_write_reg_mask(priv, 0x05, air_cable1_in, 0x60);
+		}
 	}
 
 err:

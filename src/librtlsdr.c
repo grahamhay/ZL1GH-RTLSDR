@@ -39,12 +39,6 @@
 #define LIBUSB_CALL
 #endif
 
-/* libusb < 1.0.9 doesn't have libusb_handle_events_timeout_completed */
-#ifndef HAVE_LIBUSB_HANDLE_EVENTS_TIMEOUT_COMPLETED
-#define libusb_handle_events_timeout_completed(ctx, tv, c) \
-	libusb_handle_events_timeout(ctx, tv)
-#endif
-
 /* two raised to the power of n */
 #define TWO_POW(n)		((double)(1ULL<<(n)))
 
@@ -125,8 +119,10 @@ struct rtlsdr_dev {
 	int dev_lost;
 	int driver_active;
 	unsigned int xfer_errors;
+	char manufact[256];
+	char product[256];
 	int force_bt;
-	int force_ds;
+	enum rtlsdr_ds_mode direct_sampling_mode;
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
@@ -891,22 +887,43 @@ int rtlsdr_read_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_
 int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq)
 {
 	int r = -1;
+	int last_ds;
 
 	if (!dev || !dev->tuner)
 		return -1;
 
+	/* Get the last direct sampling status */
+	last_ds = rtlsdr_get_direct_sampling(dev);
+	if (last_ds < 0)
+		return 1;
+
+	/* Check if direct sampling should be enabled.
+	* Also only enable auto switch if ds mode is 0 (aka None, or standard mode)
+	*/
+	if(dev->direct_sampling_mode == 0) {
+		dev->direct_sampling = (freq < 24000000 && dev->tuner_type == RTLSDR_TUNER_R820T) ? 2 : 0;
+	}
+
 	if (dev->direct_sampling) {
+		rtlsdr_set_i2c_repeater(dev, 0);
 		r = rtlsdr_set_if_freq(dev, freq);
 	} else if (dev->tuner && dev->tuner->set_freq) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_freq(dev, freq - dev->offs_freq);
-		rtlsdr_set_i2c_repeater(dev, 0);
+		/*rtlsdr_set_i2c_repeater(dev, 0);*/
 	}
 
 	if (!r)
 		dev->freq = freq;
 	else
 		dev->freq = 0;
+
+	/* Have to run this after dev->freq is updated to avoid setting
+	* the previous frequency back again
+	*/
+	if (last_ds != dev->direct_sampling) {
+		return _rtlsdr_set_direct_sampling(dev, dev->direct_sampling);
+	}
 
 	return r;
 }
@@ -1042,7 +1059,7 @@ int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 	if (dev->tuner->set_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain((void *)dev, gain);
-		rtlsdr_set_i2c_repeater(dev, 0);
+		/*rtlsdr_set_i2c_repeater(dev, 0);*/
 	}
 
 	if (!r)
@@ -1071,7 +1088,7 @@ int rtlsdr_set_tuner_if_gain(rtlsdr_dev_t *dev, int stage, int gain)
 	if (dev->tuner->set_if_gain) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_if_gain(dev, stage, gain);
-		rtlsdr_set_i2c_repeater(dev, 0);
+		/*rtlsdr_set_i2c_repeater(dev, 0);*/
 	}
 
 	return r;
@@ -1087,7 +1104,7 @@ int rtlsdr_set_tuner_gain_mode(rtlsdr_dev_t *dev, int mode)
 	if (dev->tuner->set_gain_mode) {
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->set_gain_mode((void *)dev, mode);
-		rtlsdr_set_i2c_repeater(dev, 0);
+		/*rtlsdr_set_i2c_repeater(dev, 0);*/
 	}
 
 	return r;
@@ -1166,17 +1183,33 @@ int rtlsdr_set_agc_mode(rtlsdr_dev_t *dev, int on)
 	if (!dev)
 		return -1;
 
+	/* FOR TESTING ONLY. Uncomment to enable repurposing the RTL AGC button
+	* for switching registers on/off. Uses to test functions of registers easily. */
+
+	/*
+	rtlsdr_set_i2c_repeater(dev, 1);
+	r82xx_toggle_test(&dev->r82xx_p, on);
+	rtlsdr_set_i2c_repeater(dev, 0);
+	return 0;
+	*/
+
 	return rtlsdr_demod_write_reg(dev, 0, 0x19, on ? 0x25 : 0x05, 1);
 }
 
+
 int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
+{
+	/* When the UI sets the ds mode, remember the mode set */
+	dev->direct_sampling_mode = (enum rtlsdr_ds_mode)on;
+	return _rtlsdr_set_direct_sampling(dev, on);
+}
+
+int _rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 {
 	int r = 0;
 
 	if (!dev)
 		return -1;
-
-	if(dev->force_ds) on = 2;
 
 	if (on) {
 		if (dev->tuner && dev->tuner->exit) {
@@ -1250,13 +1283,16 @@ int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 	if (!dev)
 		return -1;
 
-	// RTL-SDR-BLOG Hack, enables us to turn on the bias tee by clicking on "offset tuning" in software that doesn't have specified bias tee support.
-	// Offset tuning is not used for R820T devices so it is no problem.
-	rtlsdr_set_gpio(dev, 0, on);
-
 	if ((dev->tuner_type == RTLSDR_TUNER_R820T) ||
-	    (dev->tuner_type == RTLSDR_TUNER_R828D))
+	    (dev->tuner_type == RTLSDR_TUNER_R828D)) {
+		/* RTL-SDR-BLOG Hack, enables us to turn on the bias tee by
+		* clicking on "offset tuning" in software that doesn't have
+		* specified bias tee support. Offset tuning is not used for
+		*R820T devices so it is no problem.
+		*/
+		rtlsdr_set_bias_tee(dev, on);
 		return -2;
+	}
 
 	if (dev->direct_sampling)
 		return -3;
@@ -1445,6 +1481,16 @@ int rtlsdr_get_index_by_serial(const char *serial)
 	return -3;
 }
 
+/* Returns true if the manufact_check and product_check strings match what is in the dongles EEPROM */
+int rtlsdr_check_dongle_model(void *dev, char *manufact_check, char *product_check)
+{
+	if ((strcmp(((rtlsdr_dev_t *)dev)->manufact, manufact_check) == 0&& strcmp(((rtlsdr_dev_t *)dev)->product, product_check) == 0))
+		return 1;
+
+	return 0;
+}
+
+
 int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 {
 	int r;
@@ -1544,6 +1590,9 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	rtlsdr_init_baseband(dev);
 	dev->dev_lost = 0;
 
+	/* Get device manufacturer and product id */
+	r = rtlsdr_get_usb_strings(dev, dev->manufact, dev->product, NULL);
+
 	/* Probe tuners */
 	rtlsdr_set_i2c_repeater(dev, 1);
 
@@ -1571,6 +1620,10 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
 	if (reg == R82XX_CHECK_VAL) {
 		fprintf(stderr, "Found Rafael Micro R828D tuner\n");
+
+		if (rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4"))
+			fprintf(stderr, "RTL-SDR Blog V4 Detected\n");
+
 		dev->tuner_type = RTLSDR_TUNER_R828D;
 		goto found;
 	}
@@ -1604,7 +1657,10 @@ found:
 
 	switch (dev->tuner_type) {
 	case RTLSDR_TUNER_R828D:
-		dev->tun_xtal = R828D_XTAL_FREQ;
+		/* If NOT an RTL-SDR Blog V4, set typical R828D 16 MHz freq. Otherwise, keep at 28.8 MHz. */
+		if (!(rtlsdr_check_dongle_model(dev, "RTLSDRBlog", "Blog V4"))) {
+			dev->tun_xtal = R828D_XTAL_FREQ;
+		}
 		/* fall-through */
 	case RTLSDR_TUNER_R820T:
 		/* disable Zero-IF mode */
@@ -1619,25 +1675,22 @@ found:
 
 		/* enable spectrum inversion */
 		rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
-
 		break;
 	case RTLSDR_TUNER_UNKNOWN:
 		fprintf(stderr, "No supported tuner found\n");
-		rtlsdr_set_direct_sampling(dev, 2);
+		rtlsdr_set_direct_sampling(dev, 1);
 		break;
 	default:
 		break;
 	}
 
-
-    /* Hack to force the Bias T to always be on if we set the IR-Endpoint bit in the EEPROM to 0. Default on EEPROM is 1. */
+	/* Hack to force the Bias T to always be on if we set the IR-Endpoint
+	* bit in the EEPROM to 0. Default on EEPROM is 1.
+	*/
 	r = rtlsdr_read_eeprom(dev, buf, 0, EEPROM_SIZE);
-    dev->force_bt = (buf[7] & 0x02) ? 0 : 1;
-	if(dev->force_bt) rtlsdr_set_gpio(dev, 0, 1);
-	/* Hack to force direct sampling mode to always be on if we set the remote-enabled bit in the EEPROM to 1. Default on EEPROM is 0. */
-	dev->force_ds = (buf[7] & 0x01) ? 1 : 0;
-	if(dev->force_ds) dev->tuner_type = RTLSDR_TUNER_UNKNOWN;
-
+	dev->force_bt = (buf[7] & 0x02) ? 0 : 1;
+	if(dev->force_bt)
+		rtlsdr_set_bias_tee(dev, 1);
 
 	if (dev->tuner->init)
 		r = dev->tuner->init(dev);
@@ -1951,6 +2004,9 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 					/* handle events after canceling
 					 * to allow transfer status to
 					 * propagate */
+#ifdef _WIN32
+					Sleep(1);
+#endif
 					libusb_handle_events_timeout_completed(dev->ctx,
 									       &zerotv, NULL);
 					if (r < 0)
@@ -2030,28 +2086,24 @@ int rtlsdr_i2c_read_fn(void *dev, uint8_t addr, uint8_t *buf, int len)
 	return -1;
 }
 
-int rtlsdr_set_bias_tee(rtlsdr_dev_t *dev, int on)
+int rtlsdr_set_bias_tee_gpio(rtlsdr_dev_t *dev, int gpio, int on)
 {
 	if (!dev)
 		return -1;
 
-	if(dev->force_bt) on = 1; // If force_bt is on from the EEPROM, do not allow bias tee to turn off
+	/* If it's the bias tee GPIO, and force bias tee is on
+	* don't allow the bias tee to turn off. Prevents software
+	* that initializes with the bias tee off from turning it off */
+	if(gpio == 0 && dev->force_bt)
+		on = 1;
 
-	rtlsdr_set_gpio_output(dev, 0);
-	rtlsdr_set_gpio_bit(dev, 0, on);
+	rtlsdr_set_gpio_output(dev, gpio);
+	rtlsdr_set_gpio_bit(dev, gpio, on);
 
 	return 0;
 }
 
-int rtlsdr_set_gpio(rtlsdr_dev_t *dev, int gpio_pin, int on)
+int rtlsdr_set_bias_tee(rtlsdr_dev_t *dev, int on)
 {
-	if (!dev)
-		return -1;
-
-	if(dev->force_bt) on = 1; // If force_bt is on from the EEPROM, do not allow bias tee to turn off
-
-	rtlsdr_set_gpio_output(dev, gpio_pin);
-	rtlsdr_set_gpio_bit(dev, gpio_pin, on);
-
-	return 1;
+	return rtlsdr_set_bias_tee_gpio(dev, 0, on);
 }
